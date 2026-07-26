@@ -2403,18 +2403,36 @@ async function fpSaveNewPass(){
     // Kifaa hiki tayari kina akaunti hii - badilisha papo hapo, bila mtandao pia.
     let d = loadRaw();
     if(!d || !d.account || d.account.user !== uname){ showAlert('Hitilafu: akaunti haikupatikana.'); return; }
+    let oldPass = d.account.pass;
     d.account.pass = p1;
     localStorage.setItem('pos_biashara_data', JSON.stringify(d));
     if(DATA && DATA.account && DATA.account.user===uname) DATA.account.pass = p1;
     closeForgotPass();
-    showAlert('Nenosiri limebadilishwa. Sasa unaweza kuingia (Login) na nenosiri jipya.');
-    // Sasisha kimya kimya kwenye wingu (kama kuna mtandao) ili vifaa vingine navyo vipate nenosiri jipya
-    if(navigator.onLine && sbClient && d.account.simu){
-      fetch(RESET_PASSWORD_URL, {
-        method:'POST',
-        headers:{ 'Content-Type':'application/json', 'apikey':SUPABASE_ANON_KEY },
-        body: JSON.stringify({ login_user: uname, simu: d.account.simu, newPass: p1 })
-      }).catch(()=>{});
+
+    // Sasisha nenosiri Supabase Auth RASMI: ingia kwa nenosiri la zamani kupata session,
+    // kisha tumia auth.updateUser (njia rasmi ya Supabase) - hii ndiyo njia pekee ya uhakika
+    // ili vifaa vingine (simu nyingine) navyo viweze kuingia kwa nenosiri jipya.
+    let cloudSynced = false;
+    if(navigator.onLine && sbClient && oldPass){
+      try{
+        const session = await authEnsureSession(uname, oldPass);
+        if(session){
+          const { error: updErr } = await sbClient.auth.updateUser({ password: p1 });
+          if(!updErr){
+            cloudSynced = true;
+            markDirty();
+            pushToCloud();
+          } else {
+            console.warn('Imeshindwa kusasisha nenosiri mtandaoni:', updErr.message);
+          }
+        }
+      }catch(e){ console.warn('Hitilafu ya kusasisha nenosiri mtandaoni:', e); }
+    }
+
+    if(cloudSynced){
+      showAlert('Nenosiri limebadilishwa na limesasishwa mtandaoni. Sasa unaweza kuingia (Login) kwa nenosiri jipya kwenye kifaa hiki na vifaa vingine.');
+    } else {
+      showAlert('Nenosiri limebadilishwa kwenye kifaa hiki. KUMBUKA: haikuweza kusasishwa mtandaoni (huenda hukuwa na mtandao, au nenosiri la zamani halikutambulika). Hii inamaanisha vifaa vingine bado vitahitaji nenosiri la ZAMANI mpaka data ya kifaa hiki isawazishwe (sync) ikiwa na mtandao.');
     }
     return;
   }
