@@ -5868,12 +5868,48 @@ function spawnSplashParticles(){
 <script>
 (function(){
   // 1) Sajili service worker (inahitajika ili kivinjari kione app ni "installable")
-  // Service Worker: imezimwa katika toleo la faili moja (single-file build).
-  // Sababu: vivinjari/majukwaa hayaruhusu kusajili Service Worker kutoka
-  // blob: au data: URL (kikomo cha usalama cha wavuti, si hitilafu ya app).
-  // App inaendelea kufanya kazi kikamilifu bila caching ya offline.
-  // Kwa PWA yenye offline support kamili, tumia faili la service-worker.js
-  // kando na index.html kwenye hosting halisi (https).
+  // Tunabaki na faili MOJA (single-file build): badala ya service-worker.js
+  // tofauti, tunaandika msimbo wa SW kama string na kuutengenezea Blob URL
+  // wakati wa run-time, kisha kuusajili kutoka hapo. Hii inafanya kazi kwa
+  // sababu ukurasa wenyewe unatoka https halisi (Netlify) - si data:/blob:.
+  if('serviceWorker' in navigator){
+    window.addEventListener('load', function(){
+      var swCode = [
+        "const CACHE_NAME = 'mauzo-plus-v1';",
+        "self.addEventListener('install', function(event){",
+        "  self.skipWaiting();",
+        "});",
+        "self.addEventListener('activate', function(event){",
+        "  event.waitUntil(",
+        "    caches.keys().then(function(keys){",
+        "      return Promise.all(keys.filter(function(k){return k!==CACHE_NAME;}).map(function(k){return caches.delete(k);}));",
+        "    })",
+        "  );",
+        "  self.clients.claim();",
+        "});",
+        "self.addEventListener('fetch', function(event){",
+        "  event.respondWith(",
+        "    fetch(event.request).then(function(response){",
+        "      var clone = response.clone();",
+        "      caches.open(CACHE_NAME).then(function(cache){ cache.put(event.request, clone).catch(function(){}); });",
+        "      return response;",
+        "    }).catch(function(){",
+        "      return caches.match(event.request);",
+        "    })",
+        "  );",
+        "});"
+      ].join('\n');
+      try{
+        var swBlob = new Blob([swCode], {type: 'application/javascript'});
+        var swUrl = URL.createObjectURL(swBlob);
+        navigator.serviceWorker.register(swUrl).catch(function(err){
+          console.warn('Usajili wa Service Worker umeshindwa:', err);
+        });
+      }catch(err){
+        console.warn('Kutengeneza Service Worker Blob kumeshindwa:', err);
+      }
+    });
+  }
 
   // 2) Kamata tukio la beforeinstallprompt na uonyeshe kitufe chetu cha "Install"
   //    (hii ndiyo dirisha la asili la kivinjari linalojitokeza baada ya kubofya)
