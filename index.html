@@ -1029,7 +1029,7 @@ button.scan-btn{background:linear-gradient(135deg,#29b6f6,#0757d8);box-shadow:0 
       <span class="dt-sep">·</span>
       <div class="dt-date" id="dtDate"></div>
     </div>
-    <div class="sync-badge sync-offline" id="syncBadge">📴 Nje ya Mtandao</div>
+    <div class="sync-badge sync-offline" id="syncBadge" onclick="forceSyncNow()" title="Bofya kulazimisha sync sasa">📴 Nje ya Mtandao</div>
   </div>
 
   <div class="ticker">
@@ -1344,8 +1344,17 @@ function scheduleSync(){
 }
 
 /* ---- Supabase Auth halisi: kila duka lina akaunti yake (email bandia + PIN yake) ---- */
+// FIX: jina la mtumiaji (login username) daima linasawazishwa (trim + lowercase)
+// kabla ya kutumika popote (email bandia, kuhifadhi Supabase, kutafuta data).
+// Hii inazuia tatizo la "kifaa kipya hakiwezi login" linalotokea pale herufi
+// kubwa/ndogo zinatofautiana kati ya kifaa kimoja na kingine (mfano "Duka1"
+// dhidi ya "duka1") — hapo awali hitilafu hii ilisababisha kushindwa
+// kupatikana kwa data hata kama jina/nenosiri ni sahihi kabisa.
+function normLoginUser(s){
+  return (s||'').toString().trim().toLowerCase();
+}
 function syntheticEmail(loginUser){
-  let clean = (loginUser||'').toString().trim().toLowerCase().replace(/[^a-z0-9._-]/g,'');
+  let clean = normLoginUser(loginUser).replace(/[^a-z0-9._-]/g,'');
   if(!clean) clean = 'duka'+Date.now();
   return clean + '@posbiashara-app.local';
 }
@@ -1383,6 +1392,8 @@ async function authEnsureSession(loginUser, pass){
   }
 }
 
+let pushRetryTimer = null;
+let pushRetryCount = 0;
 async function pushToCloud(){
   if(!sbClient || !DATA || !DATA.account || !DATA.account.user){ return; }
   if(!navigator.onLine){ setSyncBadge('offline'); return; }
@@ -1396,21 +1407,35 @@ async function pushToCloud(){
     const uid = userData && userData.user ? userData.user.id : null;
     if(!uid) throw new Error('Haikuweza kupata user_id');
 
+    // FIX: login_user hutumwa kwa herufi ndogo (lowercase) daima, ili
+    // kutafutwa kwa uhakika baadaye kwenye kifaa kingine bila kujali
+    // jinsi mtumiaji atakavyoandika herufi kubwa/ndogo.
     const { error } = await sbClient.from('duka_sync').upsert({
       user_id: uid,
-      login_user: DATA.account.user,
+      login_user: normLoginUser(DATA.account.user),
       duka_jina: DATA.account.biz,
       data: DATA,
       updated_at: new Date().toISOString()
     }, { onConflict: 'login_user' });
     if(error) throw error;
     syncDirty = false;
+    pushRetryCount = 0;
+    if(pushRetryTimer){ clearTimeout(pushRetryTimer); pushRetryTimer = null; }
     localStorage.setItem('pos_sync_dirty','0');
     localStorage.setItem('pos_sync_last', new Date().toISOString());
     setSyncBadge('synced');
   }catch(e){
     console.warn('Hitilafu ya sync:', e);
     setSyncBadge('error');
+    // FIX: usisubiri tu dakika ya interval kuu — jaribu tena kwa haraka
+    // (backoff) ili data ifike Supabase mapema iwezekanavyo, hasa mara
+    // baada ya usajili kifaa kikiwa na mtandao usio imara.
+    if(syncDirty && navigator.onLine){
+      pushRetryCount = Math.min(pushRetryCount + 1, 6);
+      let delay = Math.min(3000 * pushRetryCount, 30000);
+      if(pushRetryTimer) clearTimeout(pushRetryTimer);
+      pushRetryTimer = setTimeout(()=>{ if(navigator.onLine && syncDirty) pushToCloud(); }, delay);
+    }
   }finally{
     syncInProgress = false;
   }
@@ -1421,28 +1446,50 @@ async function pushToCloud(){
 // Auth pale nenosiri lililowekwa kwenye kifaa kipya si sahihi au data
 // haijasawazishwa (sync) bado kutoka kifaa cha kwanza — jambo ambalo
 // lingesababisha "nenosiri sahihi halikubaliki" kimya kimya.
+// FIX: sasa inarudisha {session, reason} badala ya null tu, ili anayeita
+// aweze kumwambia mtumiaji SABABU HALISI ya kushindwa (nenosiri si sahihi,
+// akaunti haijawahi kusawazishwa mtandaoni, hakuna mtandao, n.k) badala ya
+// ujumbe wa jumla usiosaidia kutatua tatizo.
 async function authSignInOnly(loginUser, pass){
-  if(!sbClient || !navigator.onLine || !loginUser || !pass) return null;
+  if(!navigator.onLine) return { session:null, reason:'offline' };
+  if(!sbClient) return { session:null, reason:'no-client' };
+  if(!loginUser || !pass) return { session:null, reason:'missing' };
   try{
     const email = syntheticEmail(loginUser);
     let { data: existing } = await sbClient.auth.getSession();
-    if(existing && existing.session) return existing.session;
+    if(existing && existing.session) return { session: existing.session, reason:null };
     let signIn = await sbClient.auth.signInWithPassword({ email, password: pass });
-    if(!signIn.error && signIn.data && signIn.data.session) return signIn.data.session;
-    if(signIn.error) console.warn('Auth signIn (login-only) error:', signIn.error.message);
-    return null;
-  }catch(e){ console.warn('Auth signIn (login-only) session error:', e); return null; }
+    if(!signIn.error && signIn.data && signIn.data.session) return { session: signIn.data.session, reason:null };
+    if(signIn.error){
+      console.warn('Auth signIn (login-only) error:', signIn.error.message);
+      if(/invalid.*credential/i.test(signIn.error.message)) return { session:null, reason:'bad-credentials' };
+      if(/confirm/i.test(signIn.error.message)) return { session:null, reason:'not-confirmed' };
+      return { session:null, reason:'auth-error' };
+    }
+    return { session:null, reason:'unknown' };
+  }catch(e){ console.warn('Auth signIn (login-only) session error:', e); return { session:null, reason:'network' }; }
 }
 
+// FIX: (1) inatumia .ilike() badala ya .eq() ili kutafuta login_user bila
+// kujali herufi kubwa/ndogo — hii inarekebisha login hata kwa akaunti
+// zilizosajiliwa KABLA ya marekebisho haya (ambazo zilihifadhiwa na herufi
+// kubwa/ndogo tofauti). (2) inarudisha {data, reason} ili doLogin() iweze
+// kuonyesha ujumbe sahihi kabisa wa tatizo.
 async function pullFromCloud(loginUser, pass){
-  if(!sbClient || !navigator.onLine || !loginUser || !pass) return null;
+  if(!navigator.onLine) return { data:null, reason:'offline' };
+  if(!sbClient) return { data:null, reason:'no-client' };
+  if(!loginUser || !pass) return { data:null, reason:'missing' };
   try{
-    const session = await authSignInOnly(loginUser, pass);
-    if(!session) return null;
-    const { data, error } = await sbClient.from('duka_sync').select('data,updated_at').eq('login_user', loginUser).maybeSingle();
-    if(error){ console.warn('Hitilafu ya kupakua:', error); return null; }
-    return data ? data.data : null;
-  }catch(e){ console.warn('Kupakua kumeshindikana:', e); return null; }
+    const auth = await authSignInOnly(loginUser, pass);
+    if(!auth.session) return { data:null, reason: auth.reason || 'auth-error' };
+    const { data, error } = await sbClient.from('duka_sync')
+      .select('data,updated_at')
+      .ilike('login_user', normLoginUser(loginUser))
+      .maybeSingle();
+    if(error){ console.warn('Hitilafu ya kupakua:', error); return { data:null, reason:'db-error' }; }
+    if(!data){ return { data:null, reason:'no-cloud-data' }; }
+    return { data: data.data, reason:null };
+  }catch(e){ console.warn('Kupakua kumeshindikana:', e); return { data:null, reason:'network' }; }
 }
 
 /* ---- Kuangalia maagizo ya msimamizi (admin): block/unblock na ujumbe wa popup ---- */
@@ -1590,10 +1637,36 @@ window.addEventListener('offline', ()=>{ setSyncBadge('offline'); });
 setInterval(()=>{ if(navigator.onLine && syncDirty) pushToCloud(); }, 30000);
 setInterval(()=>{ checkAdminSignals(); }, 45000);
 
+// FIX: jaribu kusawazisha (sync) mara moja zaidi programu inapofichwa nyuma
+// (mfano mtumiaji akabadilisha app nyingine simuni) au anapofunga kabisa —
+// hii inapunguza sana hatari ya mabadiliko ya mwisho kutofika Supabase kabla
+// kifaa kipya hakijajaribu login.
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState==='hidden' && navigator.onLine && syncDirty){
+    pushToCloud();
+  }
+});
+window.addEventListener('pagehide', ()=>{
+  if(navigator.onLine && syncDirty) pushToCloud();
+});
+
 document.addEventListener('DOMContentLoaded', ()=>{
   setSyncBadge(navigator.onLine ? 'online' : 'offline');
   if(navigator.onLine && syncDirty) pushToCloud();
 });
+
+// FIX: humruhusu mtumiaji kubofya alama ya sync ili kulazimisha sync papo
+// hapo — muhimu sana kabla ya kwenda kuingia (login) kwenye kifaa kingine.
+async function forceSyncNow(){
+  if(!navigator.onLine){ showAlert('Huna mtandao kwa sasa. Unganisha kwenye intaneti kisha jaribu tena.', '📴 Nje ya Mtandao'); return; }
+  if(!DATA || !DATA.account || !DATA.account.user){ return; }
+  await pushToCloud();
+  if(localStorage.getItem('pos_sync_dirty')==='0'){
+    showAlert('Data yako imesawazishwa (sync) mtandaoni salama. Sasa unaweza kuingia (login) kwenye kifaa kingine.', '✅ Imekamilika');
+  } else {
+    showAlert('Imeshindwa kusawazisha kwa sasa. Hakikisha mtandao wako ni imara kisha jaribu tena.', '⚠️ Sync Imeshindwa');
+  }
+}
 /* ================= MWISHO WA SUPABASE SYNC ================= */
 
 /* ---------- MODAL HELPERS (badala ya alert/confirm/prompt) ---------- */
@@ -2239,7 +2312,7 @@ function saveNewUser(){
   let err = document.getElementById('userModalError');
   if(!name || !uname || !pass){ err.innerText='Jaza taarifa zote.'; return; }
   if(pass.length<4){ err.innerText='Nenosiri liwe angalau herufi/namba 4.'; return; }
-  if(uname===DATA.account.user || (DATA.users||[]).some(u=>u.user===uname)){
+  if(normLoginUser(uname)===normLoginUser(DATA.account.user) || (DATA.users||[]).some(u=>normLoginUser(u.user)===normLoginUser(uname))){
     err.innerText='Jina la mtumiaji (username) hilo tayari linatumika.'; return;
   }
   if(!DATA.users) DATA.users=[];
@@ -2295,10 +2368,13 @@ function goToBizTypeStep(){
   wzGoTo(1);
 }
 
-function finishRegistration(){
+async function finishRegistration(){
   if(!wzState.biz){ showAlert('Chagua biashara kwanza'); return; }
+  // FIX: jina la mtumiaji linasawazishwa (lowercase) tangu wakati wa
+  // usajili, ili kila kifaa kingine kitakachotafuta akaunti hii mtandaoni
+  // (bila kujali herufi kubwa/ndogo alizoandika) kifanikiwe kila wakati.
   let d = {
-    account:{ biz:regTemp.biz, user:regTemp.user, pass:regTemp.pass, address:'', simu:regTemp.simu||'' },
+    account:{ biz:regTemp.biz, user:normLoginUser(regTemp.user), pass:regTemp.pass, address:'', simu:regTemp.simu||'' },
     // Mtumiaji wa kwanza (aliyesajili biashara) daima ni Admin. Watumiaji
     // wengine (mfano Cashier) huongezwa na Admin kutoka Zaidi > Watumiaji.
     users: [],
@@ -2323,14 +2399,33 @@ function finishRegistration(){
   };
   localStorage.setItem('pos_biashara_data', JSON.stringify(d));
   markDirty();
-  (async ()=>{
-    await authEnsureSession(d.account.user, d.account.pass);
-    pushToCloud();
-  })();
-  showAlert('Usajili umefanikiwa');
   regTemp = null;
   document.getElementById('bizTypeFlow').style.display='none';
   showLogin();
+
+  // FIX: sasa tunasubiri na kujaribu tena (hadi mara 3) kuhakikisha data
+  // imefika Supabase KWELI kabla ya kumwambia mtumiaji "umefanikiwa" bila
+  // masharti. Hii inazuia mtumiaji kufunga programu mapema akidhani
+  // amemaliza, wakati akaunti bado haijasawazishwa mtandaoni — jambo
+  // lililokuwa chanzo kikuu cha "kifaa kipya hakiwezi login".
+  if(navigator.onLine && sbClient){
+    let ok = false;
+    DATA = d; // muhimu ili pushToCloud() ione akaunti sahihi
+    for(let attempt=0; attempt<3 && !ok; attempt++){
+      if(attempt>0) await new Promise(r=>setTimeout(r, 1500));
+      await authEnsureSession(d.account.user, d.account.pass);
+      await pushToCloud();
+      ok = (localStorage.getItem('pos_sync_dirty')==='0');
+    }
+    DATA = null; // mtumiaji bado hajaingia (login) rasmi
+    if(ok){
+      showAlert('Usajili umefanikiwa na data yako imehifadhiwa mtandaoni salama. Sasa unaweza kuingia (Login) kwenye kifaa hiki au kifaa kingine chochote.', '✅ Usajili Umefanikiwa');
+    } else {
+      showAlert('Usajili umefanikiwa kwenye kifaa hiki, LAKINI imeshindwa kusawazisha (sync) mtandaoni kwa sasa. Fungua programu tena ukiwa na mtandao mzuri ili isawazishwe — LA SIVYO, HUTAWEZA kuingia (login) kwenye kifaa kingine mpaka isawazishwe.', '⚠️ Sync Haijakamilika');
+    }
+  } else {
+    showAlert('Usajili umefanikiwa kwenye kifaa hiki. KUMBUKA: huna mtandao kwa sasa, hivyo bado HUTAWEZA kuingia (login) kwenye kifaa kingine mpaka ufungue programu hii ukiwa na mtandao ili data isawazishwe (sync).', '⚠️ Unahitaji Mtandao Kusawazisha');
+  }
 }
 
 function togglePwd(id, btn){
@@ -2344,47 +2439,68 @@ function togglePwd(id, btn){
     btn.textContent = '👁️';
   }
 }
+// FIX: ujumbe maalum kwa kila aina ya sababu ya kushindwa, badala ya
+// ujumbe mmoja wa jumla — hii inamsaidia mtumiaji kujua HASA la kufanya.
+function fpReasonMessage(reason){
+  switch(reason){
+    case 'offline':
+      return 'Hakuna mtandao kwa sasa. Unganisha kwenye intaneti kisha jaribu tena ili tupakue akaunti yako kwenye kifaa hiki.';
+    case 'bad-credentials':
+      return 'Jina la mtumiaji au nenosiri si sahihi. Hakikisha umeandika kama ulivyojisajili (nenosiri hujali herufi kubwa/ndogo, jina la mtumiaji halijali).';
+    case 'not-confirmed':
+      return 'Akaunti yako mtandaoni bado haijathibitishwa. Wasiliana na msaada (support) kwa msaada zaidi.';
+    case 'no-cloud-data':
+      return 'Jina la mtumiaji na nenosiri ni sahihi, LAKINI kifaa cha kwanza (ulikosajili) hakijawahi kusawazisha (sync) data yake mtandaoni. Fungua programu kwenye kifaa cha kwanza ukiwa na mtandao, subiri alama "✅ Imehifadhiwa" ionekane, kisha jaribu tena hapa.';
+    case 'network':
+    case 'db-error':
+      return 'Imeshindwa kuunganisha na seva. Angalia mtandao wako kisha jaribu tena.';
+    default:
+      return 'Imeshindwa kuingia. Hakikisha jina la mtumiaji na nenosiri ni sahihi, na una mtandao, kisha jaribu tena.';
+  }
+}
+
 async function doLogin(){
   let d = loadRaw();
-  let newDeviceNoRemote = false;
+  let newDeviceReason = null;
   if(!d){
     // Kifaa kipya (hakina data ndani ya simu) - jaribu kupakua kutoka Supabase
-    let uname0 = loginUser ? loginUser.value.trim() : '';
-    if(uname0 && navigator.onLine){
-      setSyncBadge('syncing');
-      let remote = await pullFromCloud(uname0, loginPass ? loginPass.value : '');
-      if(remote){
-        localStorage.setItem('pos_biashara_data', JSON.stringify(remote));
-        localStorage.setItem('pos_sync_dirty','0');
-        d = remote;
-        setSyncBadge('synced');
+    // FIX: jina la mtumiaji linasawazishwa (normLoginUser) kabla ya kutumika,
+    // hii inatatua tatizo la herufi kubwa/ndogo kutofautiana kati ya vifaa.
+    let uname0 = loginUser ? normLoginUser(loginUser.value) : '';
+    let pw0 = loginPass ? loginPass.value : '';
+    if(uname0){
+      if(navigator.onLine){
+        setSyncBadge('syncing');
+        let result = await pullFromCloud(uname0, pw0);
+        if(result.data){
+          localStorage.setItem('pos_biashara_data', JSON.stringify(result.data));
+          localStorage.setItem('pos_sync_dirty','0');
+          d = result.data;
+          setSyncBadge('synced');
+        } else {
+          setSyncBadge('online');
+          newDeviceReason = result.reason;
+        }
       } else {
-        setSyncBadge(navigator.onLine ? 'online' : 'offline');
-        newDeviceNoRemote = true;
+        newDeviceReason = 'offline';
       }
-    } else if(uname0 && !navigator.onLine){
-      newDeviceNoRemote = true;
     }
   }
   if(!d){
-    if(newDeviceNoRemote){
-      showAlert(!navigator.onLine
-        ? 'Kifaa hiki hakina data ya akaunti hii, na hakuna mtandao kwa sasa kuipakua. Unganisha kwenye intaneti kisha jaribu tena.'
-        : 'Imeshindwa kupakua akaunti kwenye kifaa hiki. Hakikisha: (1) jina la mtumiaji na nenosiri ni sahihi kabisa kama ulivyojisajili (herufi kubwa/ndogo zinajali), (2) kifaa cha kwanza kilishawahi kuwa na mtandao ili data isawazishwe (sync), kisha jaribu tena.', '⚠️ Imeshindwa Kuingia');
-    } else {
-      showAlert('Taarifa sio sahihi');
-    }
+    showAlert(fpReasonMessage(newDeviceReason), '⚠️ Imeshindwa Kuingia');
     return;
   }
   if(!d.users) d.users = [];
 
-  let uname = (loginUser.value||'').trim(), pw = loginPass.value;
+  // FIX: ulinganisho wa jina la mtumiaji sasa haujali herufi kubwa/ndogo,
+  // ili kuepuka kushindwa login kwa sababu tu ya "Duka1" dhidi ya "duka1".
+  let uname = normLoginUser(loginUser.value), pw = loginPass.value;
   let matchedUser = null; // {user, name, role}
 
-  if(uname===d.account.user && pw===d.account.pass){
+  if(uname===normLoginUser(d.account.user) && pw===d.account.pass){
     matchedUser = { user:d.account.user, name:d.account.biz, role:'admin' };
   } else {
-    let cashier = d.users.find(u=>u.user===uname && u.pass===pw);
+    let cashier = d.users.find(u=>normLoginUser(u.user)===uname && u.pass===pw);
     if(cashier) matchedUser = { user:cashier.user, name:cashier.name, role:cashier.role||'cashier' };
   }
 
