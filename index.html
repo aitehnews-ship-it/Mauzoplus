@@ -1464,8 +1464,13 @@ async function pushToCloud(){
     syncDirty = false;
     pushRetryCount = 0;
     if(pushRetryTimer){ clearTimeout(pushRetryTimer); pushRetryTimer = null; }
+    // FIX: DATA ya sasa (tuliyotuma) ndiyo iliyo mpya zaidi kwenye
+    // Supabase sasa hivi - iwekewe _syncedAt ili refreshFromCloudIfSafe()
+    // isilete tena mzunguko usio wa lazima wa "kupakua" data tuliyotuma sisi wenyewe.
+    DATA._syncedAt = new Date().toISOString();
+    localStorage.setItem('pos_biashara_data', JSON.stringify(DATA));
     localStorage.setItem('pos_sync_dirty','0');
-    localStorage.setItem('pos_sync_last', new Date().toISOString());
+    localStorage.setItem('pos_sync_last', DATA._syncedAt);
     setSyncBadge('synced');
   }catch(e){
     console.warn('Hitilafu ya sync:', e);
@@ -1537,8 +1542,59 @@ async function pullFromCloud(loginUser, pass){
       .maybeSingle();
     if(error){ console.warn('Hitilafu ya kupakua:', error); return { data:null, reason:'db-error' }; }
     if(!data){ return { data:null, reason:'no-cloud-data' }; }
-    return { data: data.data, reason:null };
+    return { data: data.data, updated_at: data.updated_at, reason:null };
   }catch(e){ console.warn('Kupakua kumeshindikana:', e); return { data:null, reason:'network' }; }
+}
+
+/* ====== TATUZI KUU: "TAARIFA TOFAUTI/ZA ZAMANI KWENYE KIFAA B" ======
+   KABLA: doLogin() ilikuwa ikipakua kutoka Supabase TU pale kifaa
+   kilikuwa hakina data KABISA ndani ya localStorage (`if(!d)`). Mara
+   kifaa kilipokuwa na nakala YOYOTE ya ndani (hata ya zamani, au
+   iliyoachwa na majaribio ya awali), doLogin ilikuwa ikiitumia moja
+   kwa moja bila kuuliza Supabase tena — yaani "chanzo kikuu cha
+   ukweli" (Supabase) hakikuwa kikisomwa kwenye kila LOGIN, kinyume na
+   inavyopaswa kuwa kwa mfumo salama wa vifaa vingi. Zaidi ya hapo,
+   kifaa hicho kingeweza baadaye ku-"push" nakala yake ya zamani
+   Supabase na kufuta mabadiliko mapya yaliyowekwa na kifaa kingine
+   (last-write-wins bila kuangalia ni ipi mpya zaidi).
+
+   SASA: kila doLogin() ikiwa na mtandao, Supabase ndiyo chanzo cha
+   kwanza kuulizwa (siyo localStorage). localStorage inabaki kuwa
+   akiba ya DHARURA tu kwa matumizi ya OFFLINE — sio "cache" ambayo
+   inaweza kupitwa na wakati kimya kimya wakati mtandao upo. */
+function markLocalSynced(d, cloudUpdatedAt){
+  try{
+    d._syncedAt = cloudUpdatedAt || new Date().toISOString();
+    localStorage.setItem('pos_biashara_data', JSON.stringify(d));
+    localStorage.setItem('pos_sync_dirty','0');
+    localStorage.setItem('pos_sync_last', d._syncedAt);
+  }catch(e){}
+}
+
+/* Kupakua data mpya kutoka Supabase kwa akaunti iliyo-login SASA, kwa
+   ajili ya kuonyesha taarifa zilezile kwenye vifaa vyote wakati DATA
+   ipo tayari kwenye kumbukumbu (mfano: dirisha likirudi "visible" au
+   kila kipindi fulani), bila kuvunja kazi ya mtumiaji anayoendelea nayo. */
+async function refreshFromCloudIfSafe(){
+  if(!navigator.onLine || !sbClient) return;
+  if(!DATA || !DATA.account || !DATA.account.user) return;
+  if(syncDirty || syncInProgress) return; // usifute mabadiliko ambayo bado hayajatumwa
+  try{
+    const result = await pullFromCloud(DATA.account.user, DATA.account.pass);
+    if(result.data && result.updated_at){
+      // Chukua tu ikiwa data ya cloud ni MPYA zaidi ya ile tuliyonayo sasa.
+      if(!DATA._syncedAt || new Date(result.updated_at).getTime() > new Date(DATA._syncedAt).getTime()){
+        const keepUser = CURRENT_USER; // usimwondoe mtumiaji aliye-login sasa
+        DATA = result.data;
+        DATA._syncedAt = result.updated_at;
+        CURRENT_USER = keepUser;
+        markLocalSynced(DATA, result.updated_at);
+        if(typeof home === 'function' && document.getElementById('dashboard') && document.getElementById('dashboard').style.display!=='none'){
+          home();
+        }
+      }
+    }
+  }catch(e){ console.warn('Ushindwa kusasisha kutoka Supabase:', e); }
 }
 
 /* ---- Kuangalia maagizo ya msimamizi (admin): block/unblock na ujumbe wa popup ---- */
@@ -1685,6 +1741,12 @@ window.addEventListener('offline', ()=>{ setSyncBadge('offline'); });
 
 setInterval(()=>{ if(navigator.onLine && syncDirty) pushToCloud(); }, 30000);
 setInterval(()=>{ checkAdminSignals(); }, 45000);
+// Kila baada ya dakika moja, kama tuko kwenye dashboard na hakuna
+// mabadiliko ya ndani ambayo hayajatumwa, soma upya kutoka Supabase —
+// hii inahakikisha kifaa hiki kinaonyesha taarifa zilezile na vifaa
+// vingine vinavyotumia akaunti hii hii, hata kama havijafanya
+// logout/login upya.
+setInterval(()=>{ if(navigator.onLine && DATA) refreshFromCloudIfSafe(); }, 60000);
 
 // FIX: jaribu kusawazisha (sync) mara moja zaidi programu inapofichwa nyuma
 // (mfano mtumiaji akabadilisha app nyingine simuni) au anapofunga kabisa —
@@ -1693,6 +1755,13 @@ setInterval(()=>{ checkAdminSignals(); }, 45000);
 document.addEventListener('visibilitychange', ()=>{
   if(document.visibilityState==='hidden' && navigator.onLine && syncDirty){
     pushToCloud();
+  }
+  // Mtumiaji akirudi kwenye programu (mfano baada ya kubadilisha app
+  // nyingine simuni, au baada ya kufungua tena baada ya muda), soma
+  // upya kutoka Supabase ili kuonyesha mabadiliko yaliyofanywa na
+  // vifaa vingine wakati huu — bila kuvunja kazi isiyotumwa bado.
+  if(document.visibilityState==='visible' && navigator.onLine && DATA){
+    refreshFromCloudIfSafe();
   }
 });
 window.addEventListener('pagehide', ()=>{
@@ -2466,6 +2535,7 @@ async function finishRegistration(){
       await pushToCloud();
       ok = (localStorage.getItem('pos_sync_dirty')==='0');
     }
+    if(ok){ d._syncedAt = new Date().toISOString(); localStorage.setItem('pos_biashara_data', JSON.stringify(d)); }
     DATA = null; // mtumiaji bado hajaingia (login) rasmi
     if(ok){
       showAlert('Usajili umefanikiwa na data yako imehifadhiwa mtandaoni salama. Sasa unaweza kuingia (Login) kwenye kifaa hiki au kifaa kingine chochote.', '✅ Usajili Umefanikiwa');
@@ -2509,32 +2579,75 @@ function fpReasonMessage(reason){
 }
 
 async function doLogin(){
-  let d = loadRaw();
+  // FIX KUU (chanzo cha "taarifa tofauti kati ya vifaa"):
+  // Awali, Supabase ilikuwa ikiulizwa TU kama kifaa kilikuwa hakina
+  // data KABISA ndani ya localStorage. Kifaa kikishawahi kuwa na
+  // nakala yoyote ya ndani (hata ya zamani), login ilitumia moja kwa
+  // moja nakala hiyo ya kale bila kuangalia Supabase tena. SASA:
+  // ikiwa kuna mtandao, Supabase (chanzo kikuu cha ukweli) NDIYO
+  // inayoulizwa KWANZA kila wakati mtu ana-login — bila kujali kama
+  // kifaa hiki kina nakala ya ndani au la. localStorage inatumika
+  // TU pale hakuna mtandao (matumizi ya kweli ya offline).
+  let localD = loadRaw();
+  let d = null;
   let newDeviceReason = null;
-  if(!d){
-    // Kifaa kipya (hakina data ndani ya simu) - jaribu kupakua kutoka Supabase
-    // FIX: jina la mtumiaji linasawazishwa (normLoginUser) kabla ya kutumika,
-    // hii inatatua tatizo la herufi kubwa/ndogo kutofautiana kati ya vifaa.
-    let uname0 = loginUser ? normLoginUser(loginUser.value) : '';
-    let pw0 = loginPass ? loginPass.value : '';
-    if(uname0){
-      if(navigator.onLine){
-        setSyncBadge('syncing');
-        let result = await pullFromCloud(uname0, pw0);
-        if(result.data){
-          localStorage.setItem('pos_biashara_data', JSON.stringify(result.data));
-          localStorage.setItem('pos_sync_dirty','0');
-          d = result.data;
-          setSyncBadge('synced');
-        } else {
-          setSyncBadge('online');
-          newDeviceReason = result.reason;
-        }
-      } else {
-        newDeviceReason = 'offline';
+
+  let uname0 = loginUser ? normLoginUser(loginUser.value) : '';
+  let pw0 = loginPass ? loginPass.value : '';
+
+  // Watumiaji wa ziada (Cashier n.k) hawana akaunti yao WENYEWE ya
+  // Supabase Auth — akaunti ya Supabase ni MOJA kwa duka (ya Admin/
+  // mmiliki). Kwa hiyo kama jina lililoandikwa ni la CASHIER (siyo la
+  // owner) na kifaa hiki tayari lina nakala ya ndani ya duka hilo,
+  // tunatumia credentials za OWNER (zilizohifadhiwa ndani ya duka hilo
+  // hilo la ndani) kupata data MPYA kutoka Supabase, kisha tunathibitisha
+  // jina/nenosiri la cashier dhidi ya nakala hiyo MPYA (si ya zamani) —
+  // hivyo hata cashier akibadilishiwa nenosiri na admin kwenye kifaa
+  // kingine, mabadiliko hayo yanaonekana papo hapo kwenye kifaa hiki.
+  let isCashierAttempt = !!(localD && localD.account && normLoginUser(localD.account.user)!==uname0 &&
+      localD.users && localD.users.some(u=>normLoginUser(u.user)===uname0));
+  let syncUser = isCashierAttempt ? localD.account.user : uname0;
+  let syncPass = isCashierAttempt ? localD.account.pass : pw0;
+
+  if(navigator.onLine && uname0 && syncUser){
+    setSyncBadge('syncing');
+
+    // Usalama: kama kifaa hiki kina mabadiliko ya ndani ambayo bado
+    // hayajatumwa Supabase (syncDirty) na ni ya AKAUNTI HII HII,
+    // yatume kwanza kabla ya kuandika juu yake na nakala ya cloud —
+    // ili tusipoteze kazi ya mtumiaji iliyokuwa bado haijasawazishwa.
+    if(localD && localD.account && normLoginUser(localD.account.user)===normLoginUser(syncUser) &&
+       localStorage.getItem('pos_sync_dirty')==='1'){
+      DATA = localD;
+      await pushToCloud();
+      DATA = null;
+    }
+
+    let result = await pullFromCloud(syncUser, syncPass);
+    if(result.data){
+      d = result.data;
+      d._syncedAt = result.updated_at;
+      markLocalSynced(d, result.updated_at);
+      setSyncBadge('synced');
+    } else {
+      setSyncBadge('online');
+      newDeviceReason = result.reason;
+      // Mtandao upo lakini Supabase haikuweza kutoa data (mfano: kifaa
+      // hiki ndicho pekee kilichowahi kusajili na bado hakijasawazisha
+      // - 'no-cloud-data'). Kwa usalama, ruhusu matumizi ya nakala ya
+      // ndani TU ikiwa ni ya akaunti hii hii, na iliyokuwa tayari
+      // imesawazishwa hapo awali (si ya "kubahatisha" akaunti tofauti).
+      if(localD && localD.account && normLoginUser(localD.account.user)===normLoginUser(syncUser) &&
+         (newDeviceReason==='no-cloud-data' || newDeviceReason==='network' || newDeviceReason==='db-error')){
+        d = localD;
       }
     }
+  } else if(!navigator.onLine){
+    // Bila mtandao: tumia nakala ya ndani tu (halisi ya offline-first).
+    newDeviceReason = 'offline';
+    if(localD) d = localD;
   }
+
   if(!d){
     showAlert(fpReasonMessage(newDeviceReason), '⚠️ Imeshindwa Kuingia');
     return;
